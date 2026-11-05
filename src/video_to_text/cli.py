@@ -17,12 +17,18 @@ from .exporter import (
     save_markdown,
 )
 from .llm_checker import LLMChecker, LLMConfig
-from .parser import extract_aweme_id_from_url, extract_douyin_urls, extract_urls_from_file
+from .models import TranscriptResult, VideoMetadata
+from .parser import (
+    detect_platform,
+    extract_urls_from_file,
+    extract_video_id_from_url,
+    extract_video_urls,
+)
 from .transcriber import SenseVoiceTranscriber
 
 app = typer.Typer(
     name="video-to-text",
-    help="批量将抖音分享链接/口令转换为 Markdown 文本 (Playwright 持久化登录 + SenseVoiceSmall + LLM 保真校对)",
+    help="批量将抖音与 B 站分享链接/口令转换为 Markdown 文本 (Playwright 持久化登录 + SenseVoiceSmall + LLM 保真校对)",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -31,6 +37,14 @@ console = Console()
 
 @app.command("login")
 def login_cmd(
+    platform: Annotated[
+        str,
+        typer.Option(
+            "--platform",
+            "-p",
+            help="要登录的平台：all (同时打开抖音和B站)、douyin 或 bilibili",
+        ),
+    ] = "all",
     profile_dir: Annotated[
         Path,
         typer.Option(
@@ -39,8 +53,8 @@ def login_cmd(
         ),
     ] = Path(".browser_profile"),
 ) -> None:
-    """打开浏览器窗口扫码登录抖音，永久保存登录状态到 .browser_profile 目录。"""
-    open_login_session(profile_dir=profile_dir.resolve())
+    """打开浏览器窗口扫码登录抖音和/或 B 站，永久保存登录状态到 .browser_profile 目录。"""
+    open_login_session(profile_dir=profile_dir.resolve(), platform=platform)
 
 
 @app.command("run")
@@ -48,7 +62,7 @@ def run_cmd(
     input_file: Annotated[
         Path,
         typer.Argument(
-            help="包含抖音分享口令或链接的文本文件路径",
+            help="包含抖音或 B 站分享口令/链接的文本文件路径",
         ),
     ] = Path("links.txt"),
     url: Annotated[
@@ -56,7 +70,7 @@ def run_cmd(
         typer.Option(
             "--url",
             "-u",
-            help="直接传入单条或多条抖音分享口令/链接（可多次指定）",
+            help="直接传入单条或多条抖音/B站分享口令或链接（可多次指定）",
         ),
     ] = None,
     output_dir: Annotated[
@@ -104,28 +118,30 @@ def run_cmd(
         ),
     ] = True,
 ) -> None:
-    """批量读取抖音分享链接/口令，提取音频并转换为独立 Markdown 文件。"""
+    """批量读取抖音或 B 站分享链接/口令，提取音频并转换为独立 Markdown 文件。"""
     urls: list[str] = []
     if url:
         for item in url:
-            urls.extend(extract_douyin_urls(item))
+            urls.extend(extract_video_urls(item))
     elif input_file.exists():
         urls.extend(extract_urls_from_file(input_file))
     else:
         console.print(
             f"[bold red]未找到链接文件 {input_file}，且未通过 -u 传入链接。[/bold red]\n"
-            f"请将抖音分享口令粘贴到 [cyan]{input_file}[/cyan] 中，或使用 [cyan]uv run video-to-text run -u '分享口令'[/cyan]。"
+            f"请将抖音或 B 站分享口令粘贴到 [cyan]{input_file}[/cyan] 中，或使用 [cyan]uv run video-to-text run -u '分享链接'[/cyan]。"
         )
         raise typer.Exit(code=1)
 
     # 去重
     unique_urls = list(dict.fromkeys(urls))
     if not unique_urls:
-        console.print("[yellow]未在输入中提取到任何有效的抖音链接，请检查 links.txt 内容。[/yellow]")
+        console.print(
+            "[yellow]未在输入中提取到任何有效的抖音或 B 站链接，请检查 links.txt 内容。[/yellow]"
+        )
         raise typer.Exit(code=0)
 
     console.print(
-        f"[bold green]共提取到 {len(unique_urls)} 条抖音链接，准备开始批量处理...[/bold green]"
+        f"[bold green]共提取到 {len(unique_urls)} 条视频链接，准备开始批量处理...[/bold green]"
     )
 
     llm_config = LLMConfig.from_env()
@@ -150,77 +166,137 @@ def run_cmd(
     success_items: list[tuple[str, str, Path]] = []
     skipped_items: list[tuple[str, Path]] = []
     failed_items: list[tuple[str, str]] = []
+    downloaded_tasks: list[VideoMetadata] = []
+    seen_video_ids: set[str] = set()
 
     try:
+        # ==================== 阶段一：批量解析视频并提取音频 ====================
+        console.rule("[bold magenta]阶段一：批量解析视频信息并提取音频[/bold magenta]")
         with DouyinDownloader(
             profile_dir=profile_dir,
             temp_dir=temp_dir,
             headless=headless,
         ) as downloader:
             for idx, item_url in enumerate(unique_urls, start=1):
-                console.rule(f"[bold cyan]处理进度 ({idx}/{len(unique_urls)})[/bold cyan]")
+                platform_tag = (
+                    "B站" if detect_platform(item_url) == "bilibili" else "抖音"
+                )
+                console.rule(
+                    f"[bold cyan]下载进度 ({idx}/{len(unique_urls)}) [{platform_tag}][/bold cyan]"
+                )
                 console.print(f"[dim]原始链接:[/dim] {item_url}")
 
-                # 如果链接本身已带 aweme_id，先检查是否已转换过
-                url_aweme_id = extract_aweme_id_from_url(item_url)
-                if not force and url_aweme_id:
-                    existing_md = find_existing_markdown(output_dir, url_aweme_id)
+                # 如果链接本身已带作品 ID，先检查是否在本批次中重复或已转换过
+                url_video_id = extract_video_id_from_url(item_url)
+                if url_video_id and url_video_id in seen_video_ids:
+                    console.print(
+                        f"[yellow]↷ 当前批次中已包含相同作品 ID ({url_video_id})，跳过重复链接[/yellow]"
+                    )
+                    continue
+                if not force and url_video_id:
+                    existing_md = find_existing_markdown(output_dir, url_video_id)
                     if existing_md:
                         console.print(
-                            f"[yellow]↷ 已存在转换结果，跳过:[/yellow] {existing_md.name}"
+                            f"[yellow]↷ 已存在转换结果，跳过下载:[/yellow] {existing_md.name}"
                         )
                         skipped_items.append((item_url, existing_md))
+                        seen_video_ids.add(url_video_id)
                         continue
 
-                audio_path: Path | None = None
                 try:
-                    console.print("1. 正在通过 Playwright 解析视频信息并提取音频...")
+                    console.print(
+                        f"正在通过 Playwright 解析{platform_tag}视频信息并提取音频..."
+                    )
                     metadata = downloader.process_url(item_url)
-                    audio_path = metadata.audio_path
 
-                    # 解析出真实 aweme_id 后再次检查是否已存在（针对短链重定向后得到 ID 的情况）
+                    # 解析出真实作品 ID 后检查是否与当前批次之前的任务重复（如短链与长链指向同一视频）
+                    if metadata.aweme_id in seen_video_ids:
+                        console.print(
+                            f"[yellow]↷ 当前批次中已包含相同作品 ID ({metadata.aweme_id})，跳过重复任务[/yellow]"
+                        )
+                        continue
+
+                    # 检查输出目录是否已存在该作品 ID 的文稿（针对短链重定向后得到 ID 的情况）
                     if not force and metadata.aweme_id:
-                        existing_md = find_existing_markdown(output_dir, metadata.aweme_id)
+                        existing_md = find_existing_markdown(
+                            output_dir, metadata.aweme_id
+                        )
                         if existing_md:
                             console.print(
                                 f"[yellow]↷ 已存在转换结果，跳过:[/yellow] {existing_md.name}"
                             )
+                            if metadata.audio_path and metadata.audio_path.exists():
+                                metadata.audio_path.unlink(missing_ok=True)
                             skipped_items.append((item_url, existing_md))
+                            seen_video_ids.add(metadata.aweme_id)
                             continue
 
+                    if metadata.aweme_id:
+                        seen_video_ids.add(metadata.aweme_id)
                     console.print(
-                        f"   [green]✓ 解析成功:[/green] [bold]{metadata.author}[/bold] - {metadata.title}"
+                        f"   [green]✓ 音频就绪:[/green] [bold]{metadata.author}[/bold] - {metadata.title}"
                     )
-                    console.print("2. 正在使用 SenseVoiceSmall 进行语音转文字...")
-                    result = transcriber.transcribe(metadata)
-                    console.print(
-                        f"   [green]✓ 语音识别完成 ({result.elapsed_seconds:.2f}s)[/green]"
-                    )
-
-                    if llm_checker is not None:
-                        console.print(
-                            f"3. 正在调用大模型 ([bold]{llm_config.model}[/bold]) 进行保真错别字校对..."
-                        )
-                        try:
-                            llm_checker.check_result(result)
-                            console.print(
-                                f"   [green]✓ AI 保真校对完成 ({result.llm_elapsed_seconds:.2f}s)[/green]"
-                            )
-                        except Exception as llm_exc:
-                            console.print(
-                                f"   [yellow]⚠ 大模型校对失败，已自动降级保留原始识别文本: {llm_exc}[/yellow]"
-                            )
-
-                    md_path = save_markdown(result, output_dir=output_dir)
-                    console.print(f"   [bold green]✓ 已生成文稿:[/bold green] {md_path}")
-                    success_items.append((metadata.author, metadata.title, md_path))
+                    downloaded_tasks.append(metadata)
                 except Exception as exc:
-                    console.print(f"   [bold red]✗ 处理失败:[/bold red] {exc}")
+                    console.print(f"   [bold red]✗ 下载/解析失败:[/bold red] {exc}")
                     failed_items.append((item_url, str(exc)))
+
+        # 此时 Playwright 浏览器上下文已自动关闭并释放内存
+        # ==================== 阶段二：统一加载模型并批量语音转文字 ====================
+        transcribed_items: list[tuple[TranscriptResult, Path]] = []
+        if downloaded_tasks:
+            console.rule(
+                f"[bold magenta]阶段二：批量语音转文字 (共 {len(downloaded_tasks)} 个音频)[/bold magenta]"
+            )
+            for idx, metadata in enumerate(downloaded_tasks, start=1):
+                console.rule(
+                    f"[bold cyan]语音识别进度 ({idx}/{len(downloaded_tasks)}) - {metadata.author}[/bold cyan]"
+                )
+                console.print(f"[bold]{metadata.title}[/bold]")
+                audio_path = metadata.audio_path
+                try:
+                    result = transcriber.transcribe(metadata)
+                    # 先将原始识别结果落盘保存为 .md（即使后续跳过或中断，识别初稿也不会丢失）
+                    md_path = save_markdown(result, output_dir=output_dir)
+                    console.print(
+                        f"   [green]✓ 语音识别完成 ({result.elapsed_seconds:.2f}s)，初稿已保存:[/green] {md_path.name}"
+                    )
+                    transcribed_items.append((result, md_path))
+                except Exception as exc:
+                    console.print(f"   [bold red]✗ 转写失败:[/bold red] {exc}")
+                    failed_items.append((metadata.source_url, str(exc)))
                 finally:
-                    # 及时清理当前视频的临时音频文件
                     if audio_path and audio_path.exists():
                         audio_path.unlink(missing_ok=True)
+
+        # ==================== 阶段三：全局大并发大模型保真校对 ====================
+        if transcribed_items and llm_checker is not None:
+            console.rule(
+                f"[bold magenta]阶段三：全局并发大模型保真校对 (共 {len(transcribed_items)} 篇文稿, 模型: {llm_config.model})[/bold magenta]"
+            )
+            results_only = [item[0] for item in transcribed_items]
+            batch_errors = llm_checker.check_batch(results_only)
+
+            for (result, md_path), err in zip(
+                transcribed_items, batch_errors.values()
+            ):
+                if err is not None:
+                    console.print(
+                        f"   [yellow]⚠ 《{result.metadata.title}》AI 校对失败，已保留原始识别初稿: {err}[/yellow]"
+                    )
+                else:
+                    md_path = save_markdown(result, output_dir=output_dir)
+                    console.print(
+                        f"   [bold green]✓ 已更新 AI 校对版:[/bold green] {md_path}"
+                    )
+                success_items.append(
+                    (result.metadata.author, result.metadata.title, md_path)
+                )
+        else:
+            for result, md_path in transcribed_items:
+                success_items.append(
+                    (result.metadata.author, result.metadata.title, md_path)
+                )
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -245,7 +321,7 @@ def check_cmd(
         ),
     ] = False,
 ) -> None:
-    """对已生成的 Markdown 文稿单独执行大模型保真错别字校对（无需重新下载视频和语音识别）。"""
+    """对已生成的 Markdown 文稿批量执行全局并发大模型保真校对（无需重新下载视频和语音识别）。"""
     llm_config = LLMConfig.from_env()
     if not llm_config.is_configured:
         console.print(
@@ -271,17 +347,13 @@ def check_cmd(
     checked_count = 0
     skipped_count = 0
     failed_count = 0
+    pending_items: list[tuple[TranscriptResult, Path]] = []
 
-    console.print(
-        f"[bold cyan]准备使用模型 [bold]{llm_config.model}[/bold] 对 {len(md_files)} 个 Markdown 文件执行保真校对...[/bold cyan]"
-    )
-
-    for idx, md_path in enumerate(md_files, start=1):
-        console.rule(f"[cyan]校对进度 ({idx}/{len(md_files)}) - {md_path.name}[/cyan]")
+    for md_path in md_files:
         raw_md = md_path.read_text(encoding="utf-8")
         if not force and is_markdown_already_checked(raw_md):
             console.print(
-                f"[yellow]↷ 该文稿已包含 AI 校对版，跳过（如需重校请加 --force）[/yellow]"
+                f"[yellow]↷ 跳过已校对文稿 (加 --force 可重校):[/yellow] {md_path.name}"
             )
             skipped_count += 1
             continue
@@ -289,18 +361,32 @@ def check_cmd(
         try:
             result = parse_markdown_for_check(md_path)
             if not result.formatted_text.strip():
-                console.print("[yellow]↷ 该文稿无有效人声识别内容，跳过校对[/yellow]")
+                console.print(
+                    f"[yellow]↷ 跳过无有效人声识别内容文稿:[/yellow] {md_path.name}"
+                )
                 skipped_count += 1
                 continue
-            checker.check_result(result)
-            md_path.write_text(render_markdown(result), encoding="utf-8")
-            console.print(
-                f"[bold green]✓ 校对并更新成功 ({result.llm_elapsed_seconds:.2f}s):[/bold green] {md_path}"
-            )
-            checked_count += 1
+            pending_items.append((result, md_path))
         except Exception as exc:
-            console.print(f"[bold red]✗ 校对失败:[/bold red] {exc}")
+            console.print(f"[bold red]✗ 解析失败 ({md_path.name}):[/bold red] {exc}")
             failed_count += 1
+
+    if pending_items:
+        console.rule(
+            f"[bold cyan]开始全局并发校对 (共 {len(pending_items)} 篇文稿, 模型: {llm_config.model})[/bold cyan]"
+        )
+        results_only = [item[0] for item in pending_items]
+        batch_errors = checker.check_batch(results_only)
+        for (result, md_path), err in zip(pending_items, batch_errors.values()):
+            if err is not None:
+                console.print(f"[bold red]✗ 校对失败 ({md_path.name}):[/bold red] {err}")
+                failed_count += 1
+            else:
+                md_path.write_text(render_markdown(result), encoding="utf-8")
+                console.print(
+                    f"[bold green]✓ 校对并更新成功:[/bold green] {md_path}"
+                )
+                checked_count += 1
 
     console.rule("[bold]AI 校对汇总[/bold]")
     console.print(

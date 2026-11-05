@@ -7,15 +7,17 @@ from pathlib import Path
 
 @dataclass
 class VideoMetadata:
-    """抖音视频元数据与本地临时音频路径。"""
+    """视频元数据（支持抖音与 B 站）及本地临时音频路径。"""
 
     source_url: str
     aweme_id: str
     title: str
     author: str
+    platform: str = "douyin"
     description: str = ""
     create_time: str = ""
     media_url: str = ""
+    backup_media_urls: list[str] = field(default_factory=list)
     audio_path: Path | None = None
 
 

@@ -4,13 +4,14 @@ import re
 from pathlib import Path
 
 from .models import TranscriptResult, VideoMetadata
+from .parser import detect_platform
 
 ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 
 
 def sanitize_filename(name: str, max_length: int = 35) -> str:
     """清理文件名中的非法字符与话题标签，确保跨平台文件系统安全。"""
-    # 移除抖音话题标签 #xxx
+    # 移除抖音/B站话题标签 #xxx
     cleaned = re.sub(r"#\S+", "", name)
     cleaned = ILLEGAL_FILENAME_CHARS.sub("_", cleaned).strip(" ._")
     if not cleaned:
@@ -25,7 +26,7 @@ def find_existing_markdown(output_dir: Path, aweme_id: str) -> Path | None:
     suffix_id = aweme_id[-6:]
     for md_file in output_dir.glob(f"*_{suffix_id}.md"):
         try:
-            head = md_file.read_text(encoding="utf-8")[:500]
+            head = md_file.read_text(encoding="utf-8")[:600]
             if f"`{aweme_id}`" in head:
                 return md_file
         except Exception:
@@ -36,9 +37,11 @@ def find_existing_markdown(output_dir: Path, aweme_id: str) -> Path | None:
 def render_markdown(result: TranscriptResult) -> str:
     """将识别与大模型校对结果渲染为结构化的 Markdown 文稿。"""
     meta = result.metadata
+    platform_label = "B站 (bilibili)" if meta.platform == "bilibili" else "抖音 (douyin)"
     lines = [
         f"# {meta.title}",
         "",
+        f"- **平台**：{platform_label}",
         f"- **作者**：{meta.author}",
         f"- **作品 ID**：`{meta.aweme_id}`",
         f"- **原链接**：{meta.source_url}",
@@ -157,11 +160,23 @@ def parse_markdown_for_check(md_path: Path) -> TranscriptResult:
     if original_text == "*（未识别到有效人声内容）*":
         original_text = ""
 
+    source_url = url_match.group(1).strip() if url_match else ""
+    aweme_id = aweme_match.group(1).strip() if aweme_match else ""
+    platform = (
+        "bilibili"
+        if (
+            detect_platform(source_url) == "bilibili"
+            or aweme_id.upper().startswith(("BV", "AV"))
+        )
+        else "douyin"
+    )
+
     meta = VideoMetadata(
-        source_url=url_match.group(1).strip() if url_match else "",
-        aweme_id=aweme_match.group(1).strip() if aweme_match else "",
+        source_url=source_url,
+        aweme_id=aweme_id,
         title=title_match.group(1).strip() if title_match else md_path.stem,
         author=author_match.group(1).strip() if author_match else "未知作者",
+        platform=platform,
         description=description,
         create_time=ctime_match.group(1).strip() if ctime_match else "",
     )

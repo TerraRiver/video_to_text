@@ -20,9 +20,13 @@ from video_to_text.exporter import (
 from video_to_text.llm_checker import LLMChecker, LLMConfig, split_text_into_chunks
 from video_to_text.models import TranscriptResult, VideoMetadata
 from video_to_text.parser import (
+    clean_bilibili_url,
+    detect_platform,
     extract_aweme_id_from_url,
     extract_douyin_urls,
     extract_urls_from_file,
+    extract_video_id_from_url,
+    extract_video_urls,
 )
 from video_to_text.transcriber import clean_sensevoice_text
 
@@ -261,3 +265,156 @@ def test_llm_checker_and_markdown_roundtrip(tmp_path: Path) -> None:
     empty_md_path.write_text(render_markdown(empty_result), encoding="utf-8")
     parsed_empty = parse_markdown_for_check(empty_md_path)
     assert parsed_empty.formatted_text == ""
+
+
+def test_bilibili_urls_and_platform_detection() -> None:
+    sample_mixed = """
+    抖音口令：4.89 复制打开抖音 https://v.douyin.com/iYAbCdEf/
+    B站短链：【【何同学】我做了一个自己打字的键盘...】 https://b23.tv/abcDEF1，快来看！
+    B站长链带追踪参数：https://www.bilibili.com/video/BV1xx411c7mD/?spm_id_from=333.1007&vd_source=abcdef12345
+    B站多P链接：https://www.bilibili.com/video/BV1xx411c7mD?p=2&share_source=copy_web
+    """
+    urls = extract_video_urls(sample_mixed)
+    assert urls == [
+        "https://v.douyin.com/iYAbCdEf/",
+        "https://b23.tv/abcDEF1",
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+        "https://www.bilibili.com/video/BV1xx411c7mD?p=2",
+    ]
+
+    assert detect_platform("https://v.douyin.com/iYAbCdEf/") == "douyin"
+    assert detect_platform("https://b23.tv/abcDEF1") == "bilibili"
+    assert detect_platform("https://www.bilibili.com/video/BV1xx411c7mD") == "bilibili"
+
+    assert (
+        extract_video_id_from_url("https://www.bilibili.com/video/BV1xx411c7mD")
+        == "BV1xx411c7mD"
+    )
+    assert (
+        extract_video_id_from_url("https://www.bilibili.com/video/BV1xx411c7mD?p=2")
+        == "BV1xx411c7mD_p2"
+    )
+    assert extract_video_id_from_url("https://b23.tv/abcDEF1") is None
+    assert (
+        clean_bilibili_url(
+            "https://m.bilibili.com/video/bv1xx411c7mD/?p=1&vd_source=123"
+        )
+        == "https://www.bilibili.com/video/BV1xx411c7mD"
+    )
+
+
+def test_bilibili_state_and_playinfo_parsing() -> None:
+    initial_state = {
+        "bvid": "BV1xx411c7mD",
+        "videoData": {
+            "bvid": "BV1xx411c7mD",
+            "title": "深入理解计算机系统精讲",
+            "desc": "本课程带你精读 CSAPP 核心章节",
+            "pubdate": 1730000000,
+            "owner": {"name": "硬核计算机UP主"},
+            "pages": [
+                {"page": 1, "part": "导论与概述"},
+                {"page": 2, "part": "信息的表示和处理"},
+            ],
+        },
+        "tags": [
+            {"tag_name": "计算机科学"},
+            {"tag_name": "CSAPP"},
+        ],
+    }
+    playinfo = {
+        "data": {
+            "dash": {
+                "audio": [
+                    {
+                        "id": 30216,
+                        "bandwidth": 64000,
+                        "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/audio_low.m4s",
+                        "backupUrl": [],
+                    },
+                    {
+                        "id": 30280,
+                        "bandwidth": 192000,
+                        "baseUrl": "https://upos-sz-mirrorcos.bilivideo.com/audio_high.m4s",
+                        "backupUrl": [
+                            "https://upos-sz-mirrorhw.bilivideo.com/audio_high_bak.m4s"
+                        ],
+                    },
+                ]
+            }
+        }
+    }
+
+    meta = DouyinDownloader._parse_bilibili_state_and_playinfo(
+        source_url="https://www.bilibili.com/video/BV1xx411c7mD?p=2",
+        final_url="https://www.bilibili.com/video/BV1xx411c7mD?p=2",
+        page_num=2,
+        initial_state=initial_state,
+        playinfo=playinfo,
+    )
+
+    assert meta.platform == "bilibili"
+    assert meta.aweme_id == "BV1xx411c7mD_p2"
+    assert meta.author == "硬核计算机UP主"
+    assert meta.title == "深入理解计算机系统精讲 (P2 信息的表示和处理)"
+    assert "#计算机科学 #CSAPP" in meta.description
+    assert (
+        meta.media_url
+        == "https://upos-sz-mirrorcos.bilivideo.com/audio_high.m4s"
+    )
+    assert meta.backup_media_urls == [
+        "https://upos-sz-mirrorhw.bilivideo.com/audio_high_bak.m4s"
+    ]
+
+
+def test_llm_concurrent_chunk_order() -> None:
+    """验证多线程并发分块校对时（后发的分块先返回），最终拼接结果依然严格保持原始段落顺序。"""
+    import time as _time
+
+    def delayed_mock_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        user_msg = body["messages"][1]["content"]
+        if "第一段原始文本" in user_msg:
+            _time.sleep(0.08)
+            reply = "第一段校对后文本"
+        elif "第二段原始文本" in user_msg:
+            _time.sleep(0.03)
+            reply = "第二段校对后文本"
+        else:
+            reply = "第三段校对后文本"
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": reply}}]},
+        )
+
+    cfg = LLMConfig(
+        api_key="sk-mock",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        max_chunk_chars=12,
+        max_concurrency=50,
+    )
+    checker = LLMChecker(cfg, transport=httpx.MockTransport(delayed_mock_handler))
+    raw_input = "第一段原始文本\n\n第二段原始文本\n\n第三段原始文本"
+    checked_text, _ = checker.check_text(raw_input)
+    assert checked_text == "第一段校对后文本\n\n第二段校对后文本\n\n第三段校对后文本"
+
+    # 验证多视频 check_batch 全局并发池同时校对多篇文稿
+    res1 = TranscriptResult(
+        metadata=VideoMetadata(
+            source_url="u1", aweme_id="1", title="视频1", author="A1"
+        ),
+        raw_text=raw_input,
+        formatted_text=raw_input,
+    )
+    res2 = TranscriptResult(
+        metadata=VideoMetadata(
+            source_url="u2", aweme_id="2", title="视频2", author="A2"
+        ),
+        raw_text="第一段原始文本\n\n第二段原始文本",
+        formatted_text="第一段原始文本\n\n第二段原始文本",
+    )
+    errors = checker.check_batch([res1, res2])
+    assert errors == {0: None, 1: None}
+    assert res1.checked_text == "第一段校对后文本\n\n第二段校对后文本\n\n第三段校对后文本"
+    assert res2.checked_text == "第一段校对后文本\n\n第二段校对后文本"

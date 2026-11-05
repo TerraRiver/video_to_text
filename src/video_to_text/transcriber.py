@@ -91,7 +91,7 @@ class SenseVoiceTranscriber:
             self._model = AutoModel(
                 model=self.model_id,
                 vad_model="fsmn-vad",
-                vad_kwargs={"max_single_segment_time": 30000},
+                vad_kwargs={"max_single_segment_time": 30000, "device": "cpu"},
                 device=self.device,
                 disable_update=True,
             )
@@ -105,7 +105,7 @@ class SenseVoiceTranscriber:
                 self._model = AutoModel(
                     model=self.model_id,
                     vad_model="fsmn-vad",
-                    vad_kwargs={"max_single_segment_time": 30000},
+                    vad_kwargs={"max_single_segment_time": 30000, "device": "cpu"},
                     device="cpu",
                     disable_update=True,
                 )
@@ -128,7 +128,7 @@ class SenseVoiceTranscriber:
             "cache": {},
             "language": "auto",
             "use_itn": True,
-            "batch_size_s": 60,
+            "batch_size_s": 300,
             "merge_vad": True,
             "merge_length_s": 15,
         }
