@@ -21,11 +21,14 @@ class VideoMetadata:
 
 @dataclass
 class TranscriptResult:
-    """单个视频语音转写结果。"""
+    """单个视频语音转写与大模型校对结果。"""
 
     metadata: VideoMetadata
     raw_text: str
     formatted_text: str
+    checked_text: str = ""
+    llm_model: str = ""
+    llm_elapsed_seconds: float = 0.0
     elapsed_seconds: float = 0.0
     converted_at: str = field(
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")

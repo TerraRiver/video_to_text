@@ -9,13 +9,20 @@ from rich.console import Console
 from rich.table import Table
 
 from .downloader import DouyinDownloader, open_login_session
-from .exporter import find_existing_markdown, save_markdown
+from .exporter import (
+    find_existing_markdown,
+    is_markdown_already_checked,
+    parse_markdown_for_check,
+    render_markdown,
+    save_markdown,
+)
+from .llm_checker import LLMChecker, LLMConfig
 from .parser import extract_aweme_id_from_url, extract_douyin_urls, extract_urls_from_file
 from .transcriber import SenseVoiceTranscriber
 
 app = typer.Typer(
     name="video-to-text",
-    help="批量将抖音分享链接/口令转换为 Markdown 文本 (Playwright 持久化登录 + 阿里 SenseVoiceSmall)",
+    help="批量将抖音分享链接/口令转换为 Markdown 文本 (Playwright 持久化登录 + SenseVoiceSmall + LLM 保真校对)",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -89,6 +96,13 @@ def run_cmd(
             help="指定推理设备 (如 mps / cpu / cuda:0，默认自动检测)",
         ),
     ] = None,
+    llm: Annotated[
+        bool,
+        typer.Option(
+            "--llm/--no-llm",
+            help="是否在语音转写后调用大模型进行保真错别字校对（需在 .env 配置 LLM_API_KEY）",
+        ),
+    ] = True,
 ) -> None:
     """批量读取抖音分享链接/口令，提取音频并转换为独立 Markdown 文件。"""
     urls: list[str] = []
@@ -113,6 +127,19 @@ def run_cmd(
     console.print(
         f"[bold green]共提取到 {len(unique_urls)} 条抖音链接，准备开始批量处理...[/bold green]"
     )
+
+    llm_config = LLMConfig.from_env()
+    llm_checker: LLMChecker | None = None
+    if llm:
+        if llm_config.is_configured:
+            llm_checker = LLMChecker(llm_config)
+            console.print(
+                f"[cyan]✓ 已启用大模型保真校对 (模型: [bold]{llm_config.model}[/bold])[/cyan]"
+            )
+        else:
+            console.print(
+                "[dim]ℹ 未检测到 .env 中的 LLM_API_KEY 配置，将仅输出 SenseVoiceSmall 原始识别文本（如需开启 AI 校对，请配置 .env）。[/dim]"
+            )
 
     temp_dir = Path(".tmp_media").resolve()
     output_dir = output_dir.resolve()
@@ -166,10 +193,26 @@ def run_cmd(
                     )
                     console.print("2. 正在使用 SenseVoiceSmall 进行语音转文字...")
                     result = transcriber.transcribe(metadata)
-                    md_path = save_markdown(result, output_dir=output_dir)
                     console.print(
-                        f"   [bold green]✓ 已生成文稿 ({result.elapsed_seconds:.2f}s):[/bold green] {md_path}"
+                        f"   [green]✓ 语音识别完成 ({result.elapsed_seconds:.2f}s)[/green]"
                     )
+
+                    if llm_checker is not None:
+                        console.print(
+                            f"3. 正在调用大模型 ([bold]{llm_config.model}[/bold]) 进行保真错别字校对..."
+                        )
+                        try:
+                            llm_checker.check_result(result)
+                            console.print(
+                                f"   [green]✓ AI 保真校对完成 ({result.llm_elapsed_seconds:.2f}s)[/green]"
+                            )
+                        except Exception as llm_exc:
+                            console.print(
+                                f"   [yellow]⚠ 大模型校对失败，已自动降级保留原始识别文本: {llm_exc}[/yellow]"
+                            )
+
+                    md_path = save_markdown(result, output_dir=output_dir)
+                    console.print(f"   [bold green]✓ 已生成文稿:[/bold green] {md_path}")
                     success_items.append((metadata.author, metadata.title, md_path))
                 except Exception as exc:
                     console.print(f"   [bold red]✗ 处理失败:[/bold red] {exc}")
@@ -183,6 +226,86 @@ def run_cmd(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     _print_summary(success_items, skipped_items, failed_items)
+
+
+@app.command("check")
+def check_cmd(
+    target: Annotated[
+        Path,
+        typer.Argument(
+            help="待校对的 Markdown 文件路径或包含 .md 文件的目录（默认 ./output）",
+        ),
+    ] = Path("output"),
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="对已经包含 AI 校对版的内容强制重新校对",
+        ),
+    ] = False,
+) -> None:
+    """对已生成的 Markdown 文稿单独执行大模型保真错别字校对（无需重新下载视频和语音识别）。"""
+    llm_config = LLMConfig.from_env()
+    if not llm_config.is_configured:
+        console.print(
+            "[bold red]未检测到有效的大模型配置！[/bold red]\n"
+            "请先复制配置文件：[cyan]cp .env.example .env[/cyan]，并在 [cyan].env[/cyan] 中填入 `LLM_API_KEY`。"
+        )
+        raise typer.Exit(code=1)
+
+    target = target.resolve()
+    if target.is_file():
+        md_files = [target]
+    elif target.is_dir():
+        md_files = sorted(target.glob("*.md"))
+    else:
+        console.print(f"[bold red]找不到目标文件或目录: {target}[/bold red]")
+        raise typer.Exit(code=1)
+
+    if not md_files:
+        console.print(f"[yellow]在 {target} 中未找到任何 .md 文件。[/yellow]")
+        raise typer.Exit(code=0)
+
+    checker = LLMChecker(llm_config)
+    checked_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    console.print(
+        f"[bold cyan]准备使用模型 [bold]{llm_config.model}[/bold] 对 {len(md_files)} 个 Markdown 文件执行保真校对...[/bold cyan]"
+    )
+
+    for idx, md_path in enumerate(md_files, start=1):
+        console.rule(f"[cyan]校对进度 ({idx}/{len(md_files)}) - {md_path.name}[/cyan]")
+        raw_md = md_path.read_text(encoding="utf-8")
+        if not force and is_markdown_already_checked(raw_md):
+            console.print(
+                f"[yellow]↷ 该文稿已包含 AI 校对版，跳过（如需重校请加 --force）[/yellow]"
+            )
+            skipped_count += 1
+            continue
+
+        try:
+            result = parse_markdown_for_check(md_path)
+            if not result.formatted_text.strip():
+                console.print("[yellow]↷ 该文稿无有效人声识别内容，跳过校对[/yellow]")
+                skipped_count += 1
+                continue
+            checker.check_result(result)
+            md_path.write_text(render_markdown(result), encoding="utf-8")
+            console.print(
+                f"[bold green]✓ 校对并更新成功 ({result.llm_elapsed_seconds:.2f}s):[/bold green] {md_path}"
+            )
+            checked_count += 1
+        except Exception as exc:
+            console.print(f"[bold red]✗ 校对失败:[/bold red] {exc}")
+            failed_count += 1
+
+    console.rule("[bold]AI 校对汇总[/bold]")
+    console.print(
+        f"[green]成功: {checked_count}[/green] | [yellow]跳过: {skipped_count}[/yellow] | [red]失败: {failed_count}[/red]"
+    )
 
 
 def _print_summary(

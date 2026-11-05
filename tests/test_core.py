@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
 import av
+import httpx
 import numpy as np
 
 from video_to_text.downloader import DouyinDownloader, convert_media_to_wav16k
 from video_to_text.exporter import (
     find_existing_markdown,
+    is_markdown_already_checked,
+    parse_markdown_for_check,
     render_markdown,
     sanitize_filename,
     save_markdown,
 )
+from video_to_text.llm_checker import LLMChecker, LLMConfig, split_text_into_chunks
 from video_to_text.models import TranscriptResult, VideoMetadata
 from video_to_text.parser import (
     extract_aweme_id_from_url,
@@ -142,3 +147,117 @@ def test_convert_media_to_wav16k(tmp_path: Path) -> None:
         audio_stream = check_container.streams.audio[0]
         assert audio_stream.rate == 16000
         assert audio_stream.channels == 1
+
+
+def test_llm_config_and_chunking(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# comment\n"
+        "LLM_API_KEY='sk-test-12345'\n"
+        "LLM_BASE_URL=https://api.example.com/v1/ # 行尾注释测试\n"
+        "LLM_MODEL=qwen-plus # 默认模型\n",
+        encoding="utf-8",
+    )
+    cfg = LLMConfig.from_env(env_file)
+    assert cfg.is_configured
+    assert cfg.api_key == "sk-test-12345"
+    assert cfg.base_url == "https://api.example.com/v1"
+    assert cfg.model == "qwen-plus"
+
+    # 验证占位符 sk-xxxx 与空前缀 sk- 被识别为未配置
+    placeholder_cfg = LLMConfig(api_key="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    assert not placeholder_cfg.is_configured
+    assert not LLMConfig(api_key="sk-").is_configured
+
+    text = "第一段内容。\n\n第二段内容比较长。\n\n第三段内容。"
+    chunks = split_text_into_chunks(text, max_chars=12)
+    assert len(chunks) == 3
+    assert chunks[0] == "第一段内容。"
+
+
+def test_llm_checker_and_markdown_roundtrip(tmp_path: Path) -> None:
+    meta = VideoMetadata(
+        source_url="https://v.douyin.com/iUZFlH_XNeU/",
+        aweme_id="7703448870348475683",
+        title="被唐朝打败的突厥，跟今天的土耳其，到底是什么关系？ #土耳其 #突厥",
+        author="胖哥扯淡",
+        description="被唐朝打败的突厥，跟今天的土耳其，到底是什么关系？ #土耳其 #突厥",
+        create_time="2026-11-02 17:55:00",
+    )
+    raw_asr = "突厥韩国兴起之时，西卫把长乐公主嫁给了突厥的首领。"
+    result = TranscriptResult(
+        metadata=meta,
+        raw_text=raw_asr,
+        formatted_text=raw_asr,
+        elapsed_seconds=5.0,
+    )
+
+    # 1. 先保存未经过 AI 校对的初稿
+    md_path = save_markdown(result, tmp_path)
+    initial_md = md_path.read_text(encoding="utf-8")
+    assert not is_markdown_already_checked(initial_md)
+
+    # 2. 解析存量 Markdown 并使用 MockTransport 模拟大模型校对
+    parsed_result = parse_markdown_for_check(md_path)
+    assert parsed_result.metadata.aweme_id == "7703448870348475683"
+    assert parsed_result.formatted_text == raw_asr
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        user_msg = body["messages"][1]["content"]
+        assert "被唐朝打败的突厥" in user_msg
+        assert "突厥韩国兴起之时" in user_msg
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "突厥汗国兴起之时，西魏把长乐公主嫁给了突厥的首领。"
+                        }
+                    }
+                ]
+            },
+        )
+
+    cfg = LLMConfig(
+        api_key="sk-mock",
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+    )
+    checker = LLMChecker(cfg, transport=httpx.MockTransport(mock_handler))
+    checker.check_result(parsed_result)
+
+    assert (
+        parsed_result.checked_text
+        == "突厥汗国兴起之时，西魏把长乐公主嫁给了突厥的首领。"
+    )
+
+    # 3. 写入校对后的 Markdown，验证包含 AI 校对版与 <details> 原始文本折叠块
+    checked_md = render_markdown(parsed_result)
+    md_path.write_text(checked_md, encoding="utf-8")
+    assert is_markdown_already_checked(checked_md)
+    assert "## 语音转文字正文（AI 校对版）" in checked_md
+    assert "突厥汗国兴起之时，西魏把长乐公主嫁给了突厥的首领。" in checked_md
+    assert "<summary>查看原始语音识别文本 (SenseVoiceSmall)</summary>" in checked_md
+    assert raw_asr in checked_md
+
+    # 4. 再次解析已校对的 Markdown（如 --force 重新校对时），应提取出 <details> 内的原始文本
+    reparsed = parse_markdown_for_check(md_path)
+    assert reparsed.formatted_text == raw_asr
+
+    # 5. 验证无有效人声的文稿在解析时将 formatted_text 置为空字符串
+    empty_result = TranscriptResult(
+        metadata=meta,
+        raw_text="",
+        formatted_text="",
+        elapsed_seconds=1.0,
+    )
+    empty_md_path = tmp_path / "empty_voice.md"
+    empty_md_path.write_text(render_markdown(empty_result), encoding="utf-8")
+    parsed_empty = parse_markdown_for_check(empty_md_path)
+    assert parsed_empty.formatted_text == ""
